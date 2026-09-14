@@ -1,0 +1,4 @@
+# engine.py needs h2 only for HTTP/2; HTTP/1.1 is raw sockets and stdlib.
+h2>=4.0.0
+# server.py (optional local history store)
+requests>=2.28.0
