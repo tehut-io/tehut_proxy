@@ -1,4 +1,4 @@
-# hunter_proxy
+# tehut_proxy
 
 A raw HTTP/1.1 and HTTP/2 request engine that your AI agent can drive over MCP.
 
@@ -6,10 +6,10 @@ Four Python files. No daemon, no browser, no database, no Burp.
 
 ```bash
 pip install h2 requests
-claude mcp add hunter-proxy -- python3 /path/to/hunter_proxy/mcp_server.py
+claude mcp add tehut-proxy -- python3 /path/to/tehut_proxy/mcp_server.py
 ```
 
-That's it. The `hunter_*` tools show up in your session and you can start asking for things.
+That's it. The `tehut_*` tools show up in your session and you can start asking for things.
 
 ## What it's for
 
@@ -35,15 +35,15 @@ it just can't do them at all.
 
 | Tool | What it does |
 |---|---|
-| `hunter_send` | One request, you control everything. `protocol: h1\|h2`, `sni` separate from `authority`, headers as `[[name,value],…]` if you want duplicates. |
-| `hunter_sweep` | Same request across many values of one field (`vary: authority\|host\|path`). Returns the outliers, not 254 responses you have to read. |
-| `hunter_import` | Paste a `curl` command or a raw request. Cookies come with it. Attack it with `hunter_send base_id=<id>`. |
-| `hunter_history`, `hunter_get_request` | List and fetch what you've stored. |
-| `hunter_oob_generate`, `hunter_oob_poll`, `hunter_oob_status` | OOB through [interactsh](https://github.com/projectdiscovery/interactsh). |
+| `tehut_send` | One request, you control everything. `protocol: h1\|h2`, `sni` separate from `authority`, headers as `[[name,value],…]` if you want duplicates. |
+| `tehut_sweep` | Same request across many values of one field (`vary: authority\|host\|path`). Returns the outliers, not 254 responses you have to read. |
+| `tehut_import` | Paste a `curl` command or a raw request. Cookies come with it. Attack it with `tehut_send base_id=<id>`. |
+| `tehut_history`, `tehut_get_request` | List and fetch what you've stored. |
+| `tehut_oob_generate`, `tehut_oob_poll`, `tehut_oob_status` | OOB through [interactsh](https://github.com/projectdiscovery/interactsh). |
 
 ### The `{{OOB}}` bit
 
-Drop `{{OOB}}` anywhere in a `hunter_send` or `hunter_sweep` field and it gets swapped for a
+Drop `{{OOB}}` anywhere in a `tehut_send` or `tehut_sweep` field and it gets swapped for a
 fresh interactsh domain. Poll it after. When a callback lands, its `remote_addr` is the
 target's own egress IP, which is about as good as proof gets for a blind bug.
 
@@ -90,10 +90,10 @@ stream 3 was the thing you were looking for.
 Routing SSRF:
 
 ```
-1. hunter_import          paste your logged-in request        -> base_id
-2. hunter_sweep base_id=<id> vary=authority values=[10.0.0.1 … 10.0.0.254]
+1. tehut_import          paste your logged-in request        -> base_id
+2. tehut_sweep base_id=<id> vary=authority values=[10.0.0.1 … 10.0.0.254]
                                                               -> outliers
-3. hunter_send base_id=<id> authority=<the outlier> path=/admin
+3. tehut_send base_id=<id> authority=<the outlier> path=/admin
 ```
 
 If it's blind, put `{{OOB}}` in the header you're testing and poll afterwards. A callback
@@ -106,7 +106,7 @@ carrying your token from the target's egress IP is the finding.
 There's no scope checking in this tool. It sends what you tell it to send. Testing things
 you're not allowed to test is on you.
 
-`hunter_sweep` over a /24 is 254 requests. Know what the target can take before you fire.
+`tehut_sweep` over a /24 is 254 requests. Know what the target can take before you fire.
 
 ## Files
 

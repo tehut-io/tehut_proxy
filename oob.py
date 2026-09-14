@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hunter_proxy/oob.py — out-of-band (OOB) callbacks via interactsh, no Burp needed.
+tehut_proxy/oob.py — out-of-band (OOB) callbacks via interactsh, no Burp needed.
 
 Confirms BLIND vulnerabilities (SSRF, blind RCE, blind SQLi, XXE, host-header
 SSRF) where the response tells you nothing: you embed a unique interactsh
@@ -41,7 +41,7 @@ _BIN_CANDIDATES = [os.path.expanduser("~/go/bin/interactsh-client"), "interactsh
 # subsystem must never produce. An explicit HUNTER_OOB_LOG still wins, for an operator who
 # deliberately wants one shared file.
 _LOG = Path(os.environ.get("HUNTER_OOB_LOG")
-            or f"/tmp/hunter_oob_interactions.{os.getpid()}.jsonl")
+            or f"/tmp/tehut_oob_interactions.{os.getpid()}.jsonl")
 _DOMAIN_RE = re.compile(
     r'([a-z0-9]{20,}\.(?:oast\.(?:fun|pro|site|online|live|me)|interact\.sh))', re.I)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hunter_proxy/mcp_server.py — MCP stdio server: an AI agent -> the raw request engine.
+tehut_proxy/mcp_server.py — MCP stdio server: an AI agent -> the raw request engine.
 
 Exposes the raw request engine (engine.py) to Claude Code as MCP tools, so the AI
 can send byte-precise HTTP/1.1 + HTTP/2 requests that a browser/extension never
@@ -11,16 +11,16 @@ Transport: newline-delimited JSON-RPC over stdin/stdout (MCP stdio). No third-pa
 deps. Logs go to stderr ONLY (stdout is the protocol channel).
 
 Register with Claude Code:
-    claude mcp add hunter-proxy -- python3 /path/to/hunter_proxy/mcp_server.py
+    claude mcp add tehut-proxy -- python3 /path/to/tehut_proxy/mcp_server.py
     (use the absolute path to this file)
 
 Tools:
-    hunter_send        — one raw request, full control (the Repeater)
-    hunter_sweep       — same request across many Host/:authority/path values
+    tehut_send        — one raw request, full control (the Repeater)
+    tehut_sweep       — same request across many Host/:authority/path values
                          (routing-SSRF /24 scan, cache-key probing, vhost fuzz)
-    hunter_import      — parse a pasted curl OR raw HTTP request into history
-    hunter_history     — list captured/imported requests
-    hunter_get_request — fetch a full stored request by id
+    tehut_import      — parse a pasted curl OR raw HTTP request into history
+    tehut_history     — list captured/imported requests
+    tehut_get_request — fetch a full stored request by id
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ STORE = Path(__file__).resolve().parent / "history.jsonl"
 def _inject_oob(args, marker=None):
     """Replace every {{OOB}} in any string field with a fresh interactsh payload.
     Returns (new_args, payload_or_None). Lets blind SSRF/RCE be confirmed: put
-    {{OOB}} in a header/path/host/body, then poll hunter_oob_poll."""
+    {{OOB}} in a header/path/host/body, then poll tehut_oob_poll."""
     blob = json.dumps(args)
     if "{{OOB}}" not in blob:
         return args, None
@@ -56,7 +56,7 @@ def _inject_oob(args, marker=None):
 
 
 def log(*a):
-    print("[hunter-mcp]", *a, file=sys.stderr, flush=True)
+    print("[tehut-mcp]", *a, file=sys.stderr, flush=True)
 
 
 # ── history (shared file with server.py) ─────────────────────────────────────
@@ -179,7 +179,7 @@ def _do_send(args):
     if oob_payload:
         out["oob_payload"] = oob_payload
         out["oob_hint"] = (f"blind-vuln check: poll for the callback with "
-                           f"hunter_oob_poll marker={oob_payload.split('.')[0]} "
+                           f"tehut_oob_poll marker={oob_payload.split('.')[0]} "
                            f"— a hit's remote_addr = the target's egress IP = proof"
                            if oob_payload != "__OOB_UNAVAILABLE__"
                            else "interactsh-client not installed; {{OOB}} left un-substituted")
@@ -288,7 +288,7 @@ def _do_sweep(args):
             "outliers": outliers[:50],
             "status_dist": dict(Counter(x["status"] for x in results)),
             **({"oob_note": "each request carried a unique {{OOB}} payload keyed to its value; "
-                            "poll hunter_oob_poll (no marker) — a callback's full_id contains the "
+                            "poll tehut_oob_poll (no marker) — a callback's full_id contains the "
                             "value that triggered it, and remote_addr is that target's egress IP"}
                if has_oob else {})}
 
@@ -300,7 +300,7 @@ def _hdr_schema():
             "oneOf": [{"type": "object"}, {"type": "array"}]}
 
 TOOLS = [
-    {"name": "hunter_send",
+    {"name": "tehut_send",
      "description": "Send ONE byte-precise HTTP request the browser can't: Host/:authority "
                     "override, duplicate headers, raw framing, h2 multi-stream. The Repeater. "
                     "Set sni to route TLS to the real host while spoofing authority/host (the "
@@ -335,7 +335,7 @@ TOOLS = [
                             "extra_requests (e.g. host=192.168.0.1, path=/admin) ride it unvalidated. "
                             "Returns {responses:[...]} — one per request, in order."},
      }}},
-    {"name": "hunter_sweep",
+    {"name": "tehut_sweep",
      "description": "Send the same request across many values of one field (vary=authority|host|"
                     "path) and return the OUTLIERS vs the common response — the routing-SSRF /24 "
                     "scan, cache-key probing, or vhost fuzzing in one call. e.g. vary=authority, "
@@ -351,44 +351,44 @@ TOOLS = [
          "path": {"type": "string", "default": "/"}, "headers": _hdr_schema(),
          "body": {"type": "string"}, "base_id": {"type": "string"},
      }, "required": ["values"]}},
-    {"name": "hunter_import",
+    {"name": "tehut_import",
      "description": "Parse a pasted `curl ...` command OR a raw HTTP request into the history and "
-                    "return its id (then attack it with hunter_send base_id=<id>). Carries cookies.",
+                    "return its id (then attack it with tehut_send base_id=<id>). Carries cookies.",
      "inputSchema": {"type": "object", "properties": {
          "text": {"type": "string"}, "host": {"type": "string", "description": "for raw HTTP w/o Host"},
          "tls": {"type": "boolean", "default": True},
      }, "required": ["text"]}},
-    {"name": "hunter_history",
+    {"name": "tehut_history",
      "description": "List recent captured (from the Firefox extension) / imported requests.",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 50}}}},
-    {"name": "hunter_get_request",
+    {"name": "tehut_get_request",
      "description": "Fetch a full stored request (headers, cookies, body) by id.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
-    {"name": "hunter_oob_generate",
+    {"name": "tehut_oob_generate",
      "description": "Get a fresh interactsh OOB payload domain to embed manually in a payload "
                     "(SSRF URL, blind RCE `nslookup`, XXE SYSTEM, host header). Then poll with "
-                    "hunter_oob_poll. (Or just put {{OOB}} in a hunter_send field — auto-substituted.)",
+                    "tehut_oob_poll. (Or just put {{OOB}} in a tehut_send field — auto-substituted.)",
      "inputSchema": {"type": "object", "properties": {
          "marker": {"type": "string", "description": "optional label to identify this callback"}}}},
-    {"name": "hunter_oob_poll",
+    {"name": "tehut_oob_poll",
      "description": "Check interactsh for received OOB callbacks (DNS/HTTP). A hit CONFIRMS a blind "
                     "vuln: remote_addr = the target server's egress IP = proof. Optional marker filters.",
      "inputSchema": {"type": "object", "properties": {
          "marker": {"type": "string", "description": "only callbacks whose full-id contains this"}}}},
-    {"name": "hunter_oob_status",
+    {"name": "tehut_oob_status",
      "description": "interactsh daemon status (running, base domain, interactions logged).",
      "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
 def call_tool(name, args):
-    if name == "hunter_send":
+    if name == "tehut_send":
         return _do_send(args)
-    if name == "hunter_sweep":
+    if name == "tehut_sweep":
         return _do_sweep(args)
-    if name == "hunter_import":
+    if name == "tehut_import":
         return _do_import(args)
-    if name == "hunter_oob_generate":
+    if name == "tehut_oob_generate":
         if oob is None:
             return {"error": "interactsh-client not installed",
                     "hint": "go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest"}
@@ -396,19 +396,19 @@ def call_tool(name, args):
             return {"ok": True, **oob.generate(args.get("marker"))}
         except Exception as e:
             return {"error": str(e)}
-    if name == "hunter_oob_poll":
+    if name == "tehut_oob_poll":
         if oob is None:
             return {"error": "interactsh-client not installed"}
         hits = oob.poll(args.get("marker"))
         return {"ok": True, "count": len(hits), "interactions": hits}
-    if name == "hunter_oob_status":
+    if name == "tehut_oob_status":
         return oob.status() if oob else {"error": "interactsh-client not installed"}
-    if name == "hunter_history":
+    if name == "tehut_history":
         items = [{"id": h["id"], "method": h.get("method"), "host": h.get("host"),
                   "path": (h.get("path") or "")[:120], "source": h.get("source"),
                   "ts": h.get("ts")} for h in _history()[-int(args.get("limit", 50)):]][::-1]
         return {"ok": True, "count": len(_history()), "items": items}
-    if name == "hunter_get_request":
+    if name == "tehut_get_request":
         e = _get(args.get("id"))
         return e or {"error": "not found"}
     return {"error": f"unknown tool {name}"}
@@ -442,7 +442,7 @@ def main():
         if method == "initialize":
             _result(rid, {"protocolVersion": "2024-11-05",
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "hunter-proxy", "version": "0.1"}})
+                          "serverInfo": {"name": "tehut-proxy", "version": "0.1"}})
         elif method == "notifications/initialized":
             pass
         elif method == "ping":

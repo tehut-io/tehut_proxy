@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hunter_proxy/engine.py — the RAW request engine ("the hands").
+tehut_proxy/engine.py — the RAW request engine ("the hands").
 
 This is the part a browser extension can NOT do: emit arbitrary bytes on the
 wire with full control over the Host/:authority, duplicate headers, malformed
@@ -403,9 +403,9 @@ def send_http2(connect_host, *, connect_port=443, sni=None, authority=None,
 
     # ── THE SINGLE-PACKET PRIMITIVE ─────────────────────────────────────────────────────
     #
-    # WHY (2026-09-13). `hunter_race_condition.py` fires N requests with asyncio.gather over
-    # httpx, asking for HTTP/2. If the server does not negotiate h2, httpx SILENTLY uses
-    # HTTP/1.1 and the burst becomes N parallel connections — and nothing recorded which one
+    # WHY. The usual way to write a race test is N concurrent requests through an async HTTP
+    # client, asking for HTTP/2. If the server does not negotiate h2, most clients SILENTLY
+    # fall back to HTTP/1.1 and the burst becomes N parallel connections — and nothing recorded which one
     # happened. The timing window differs by three orders of magnitude (microseconds for a
     # true single packet, milliseconds for a parallel burst), so a negative result could not
     # distinguish "no race" from "the primitive never fired". That is the same defect class

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hunter_proxy/server.py — the local Hunter agent ("the hub").
+tehut_proxy/server.py — the local Hunter agent ("the hub").
 
 A tiny stdlib HTTP server (no deps) that:
   • receives captured requests from the Firefox extension          (POST /capture)
@@ -15,7 +15,7 @@ OOB: shells out to `interactsh-client` if present (real engagements). PortSwigge
 labs only call back to Burp Collaborator (oastify.com), so for labs keep using the
 burp_mcp_sse_client gadget; for real targets interactsh works anywhere.
 
-Run:  python3 hunter_proxy/server.py            # listens on 127.0.0.1:8788
+Run:  python3 tehut_proxy/server.py            # listens on 127.0.0.1:8788
 """
 from __future__ import annotations
 
@@ -32,9 +32,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import engine  # noqa: E402
 
 HOST = "127.0.0.1"               # localhost ONLY — never 0.0.0.0
-PORT = int(os.environ.get("HUNTER_PROXY_PORT", "8788"))
-# History lives beside this file by default; override with HUNTER_PROXY_STORE.
-STORE = Path(os.environ.get("HUNTER_PROXY_STORE",
+PORT = int(os.environ.get("TEHUT_PROXY_PORT", "8788"))
+# History lives beside this file by default; override with TEHUT_PROXY_STORE.
+STORE = Path(os.environ.get("TEHUT_PROXY_STORE",
              str(Path(__file__).resolve().parent / "history.jsonl")))
 STORE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -44,8 +44,8 @@ STORE.parent.mkdir(parents=True, exist_ok=True)
 # (the Firefox extension is configured with it once; webpages never have it).
 # Also reject non-localhost Host headers to defeat DNS-rebinding.
 import secrets
-TOKEN_FILE = Path(os.environ.get("HUNTER_PROXY_TOKEN_FILE",
-                  str(Path.home() / ".hunter_proxy_token")))
+TOKEN_FILE = Path(os.environ.get("TEHUT_PROXY_TOKEN_FILE",
+                  str(Path.home() / ".tehut_proxy_token")))
 if TOKEN_FILE.exists():
     TOKEN = TOKEN_FILE.read_text().strip()
 else:
@@ -250,9 +250,9 @@ class H(BaseHTTPRequestHandler):
 
 def main():
     _load()
-    print(f"[hunter-proxy] listening on http://{HOST}:{PORT}  (localhost only, token-gated)")
-    print(f"[hunter-proxy] token: {TOKEN_FILE}  (send it as X-Hunter-Token)")
-    print(f"[hunter-proxy] store: {STORE}  ({len(_HISTORY)} entries)")
+    print(f"[tehut-proxy] listening on http://{HOST}:{PORT}  (localhost only, token-gated)")
+    print(f"[tehut-proxy] token: {TOKEN_FILE}  (send it as X-Hunter-Token)")
+    print(f"[tehut-proxy] store: {STORE}  ({len(_HISTORY)} entries)")
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()
 
 
