@@ -31,6 +31,10 @@ import threading
 import time
 from pathlib import Path
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+import store  # noqa: E402
+
 _BIN_CANDIDATES = [os.path.expanduser("~/go/bin/interactsh-client"), "interactsh-client"]
 # PER-PROCESS log. WHY (2026-09-12, measured: 23 live interactsh clients on this host, 22 of
 # them orphaned, ALL holding this one path open). Every client keeps its own write offset, and
@@ -77,6 +81,15 @@ def ensure_started(timeout=20):
                 _LOG.write_text("")
             except Exception:
                 pass
+        # The log lives in /tmp by default and interactsh-client appends to it as-is, so
+        # whatever mode it has when the daemon starts is the mode it keeps. A callback
+        # record carries the request the TARGET sent us — which on a successful SSRF is
+        # exactly the internal data we were fishing for — so it is not for every local
+        # account to read. Narrow it before the daemon writes the first line.
+        try:
+            store.ensure_private(_LOG)
+        except Exception:
+            pass
         _DAEMON = subprocess.Popen(
             [b, "-json", "-o", str(_LOG)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)

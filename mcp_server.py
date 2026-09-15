@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import engine  # noqa: E402
+import store  # noqa: E402
 try:
     import oob  # noqa: E402  (interactsh OOB; optional)
 except Exception:
@@ -63,20 +64,14 @@ def log(*a):
 
 
 # ── history (shared file with server.py) ─────────────────────────────────────
+# Both go through store.py: the file holds captured Cookie/Authorization headers, and
+# BOTH processes append to it. See store.py for why a threading.Lock was not enough.
 def _history():
-    out = []
-    if STORE.exists():
-        for line in STORE.read_text(errors="replace").splitlines():
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                pass
-    return out
+    return store.read_all(STORE)
 
 
 def _store(entry):
-    with STORE.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
+    store.append(STORE, entry)
 
 
 def _get(hid):

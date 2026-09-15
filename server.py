@@ -29,6 +29,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import secrets
+
+import store  # noqa: E402
 import engine  # noqa: E402
 
 HOST = "127.0.0.1"               # localhost ONLY — never 0.0.0.0
@@ -43,16 +46,12 @@ STORE.parent.mkdir(parents=True, exist_ok=True)
 # http://127.0.0.1:8788 from JS. So EVERY request must carry a secret token
 # (the Firefox extension is configured with it once; webpages never have it).
 # Also reject non-localhost Host headers to defeat DNS-rebinding.
-import secrets
 TOKEN_FILE = Path(os.environ.get("TEHUT_PROXY_TOKEN_FILE",
                   str(Path.home() / ".tehut_proxy_token")))
-if TOKEN_FILE.exists():
-    TOKEN = TOKEN_FILE.read_text().strip()
-else:
-    TOKEN = secrets.token_urlsafe(32)
-    TOKEN_FILE.write_text(TOKEN)
-    try: os.chmod(TOKEN_FILE, 0o600)
-    except Exception: pass
+# store.token() mints it 0600 atomically (O_CREAT|O_EXCL) instead of writing the
+# secret at the umask default and narrowing afterwards, and makes two servers
+# starting at once share one token rather than clobber each other's.
+TOKEN = store.token(TOKEN_FILE)
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}", "127.0.0.1", "localhost", ""}
 
 _LOCK = threading.Lock()
@@ -61,22 +60,16 @@ _MAX = 2000
 
 
 def _load():
-    if STORE.exists():
-        for line in STORE.read_text(errors="replace").splitlines()[-_MAX:]:
-            try:
-                _HISTORY.append(json.loads(line))
-            except Exception:
-                pass
+    _HISTORY.extend(store.read_all(STORE, limit=_MAX))
 
 
 def _persist(entry):
+    # _LOCK still guards the in-memory ring (this process's threads); store.append
+    # takes the flock that mcp_server.py's appender can also see.
     with _LOCK:
         _HISTORY.append(entry)
         del _HISTORY[:-_MAX]
-        with STORE.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-        try: os.chmod(STORE, 0o600)   # history holds captured cookies — keep it private
-        except Exception: pass
+        store.append(STORE, entry)
 
 
 def _norm_headers(h):
