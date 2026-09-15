@@ -179,7 +179,7 @@ def _build_http1_request(spec):
     return ("\r\n".join(lines) + "\r\n\r\n").encode() + body
 
 
-def _split_http1_responses(buf):
+def _split_http1_responses(buf, max_responses=None):
     """Split a buffer of >=1 pipelined HTTP/1.1 responses into individual ones.
 
     Walks the buffer using each response's Content-Length / chunked framing so a
@@ -208,6 +208,8 @@ def _split_http1_responses(buf):
                     sz = int(buf[j:ce].split(b";")[0].strip(), 16)
                 except ValueError:
                     break
+                if sz < 0:
+                    break                 # same negative-size trap as _dechunk; see there
                 if sz == 0:
                     j = ce + 2
                     # optional trailing CRLF
@@ -215,7 +217,10 @@ def _split_http1_responses(buf):
                         j += 2
                     break
                 chunk_buf += buf[ce+2:ce+2+sz]
-                j = ce + 2 + sz + 2
+                _adv = ce + 2 + sz + 2
+                if _adv <= j:             # the cursor must advance every pass, whatever
+                    break                 # arithmetic produced it
+                j = _adv
             body = chunk_buf
             next_i = j
         else:
@@ -224,6 +229,8 @@ def _split_http1_responses(buf):
                 if ln.lower().startswith(b"content-length:"):
                     try:
                         cl = int(ln.partition(b":")[2].strip())
+                        if cl < 0:
+                            cl = None     # a negative length is malformed framing, not a length
                     except ValueError:
                         cl = None
                     break
@@ -235,6 +242,29 @@ def _split_http1_responses(buf):
                 body = buf[body_start:body_start + cl]
                 next_i = body_start + cl
         out.append(_parse_http1(head + b"\r\n\r\n" + body, 0))
+        # NEVER RETURN MORE RESPONSES THAN REQUESTS WERE SENT.
+        #
+        # WHY (2026-09-15). This splitter is the ORACLE for the connection-state / desync
+        # class: the agent concludes the ride-along request succeeded because responses[1]
+        # exists and looks like a real reply. But the body length came from the response's
+        # OWN Content-Length, which the target controls. Declare a length shorter than the
+        # bytes actually sent, put "HTTP/1.1 200 OK..." in the body, and the trailing bytes
+        # were parsed as a SECOND ok=True response — fabricated entirely by the target.
+        #
+        # Verified: one response on the wire with Content-Length: 5 and "YOU_ARE_PWNED"
+        # trailing produced TWO responses, both ok=True. A hostile target could manufacture
+        # fake admin content and bait a false submission. The tool's whole claim is proof;
+        # here the proof was target-forgeable.
+        #
+        # The caller knows how many requests it put on the connection. Anything beyond that
+        # count is, by construction, not a response to a request we sent.
+        if max_responses is not None and len(out) >= max_responses:
+            if next_i < n:
+                out[-1].note = ((out[-1].note or "") + " [trailing bytes after the last "
+                                "expected response were NOT parsed as a further response: "
+                                "only %d request(s) were sent. Target-controlled framing "
+                                "cannot invent replies.]" % max_responses).strip()
+            break
         if next_i <= i:
             break
         i = next_i
@@ -279,7 +309,7 @@ def send_http1_conn_state(connect_host, requests, *, connect_port=443, use_tls=T
         except Exception: pass
         if not buf:
             return [RawResponse(error=f"io: {e}", elapsed_ms=int((time.time()-t0)*1000))]
-    resps = _split_http1_responses(buf)
+    resps = _split_http1_responses(buf, max_responses=len(requests))
     if resps:
         resps[-1].elapsed_ms = int((time.time()-t0)*1000)
     return resps or [RawResponse(error="no response parsed", body=buf,
@@ -296,9 +326,32 @@ def _dechunk(raw):
         if j < 0:
             return None
         size_field = raw[i:j].split(b";")[0].strip()
+        # RFC 9112 7.1: chunk-size is 1*HEXDIG. A sign is not a hex digit, so reject it at
+        # the source rather than downstream — `int(b"-0", 16)` is 0 and would otherwise be
+        # read as the terminating chunk, silently ending the body early.
+        if not size_field or size_field[:1] in (b"-", b"+"):
+            return None
         try:
             n = int(size_field, 16)
         except ValueError:
+            return None
+        # A NEGATIVE CHUNK SIZE IS NOT A SIZE. int(b"-100000", 16) is accepted by Python and
+        # returns -1048576; nothing below rejected it. `end = start + n` then went NEGATIVE,
+        # which sails past `end > len(raw)`, the slice came back empty, and `i = end + 2`
+        # landed far below zero. On the next pass `raw.find(b"\r\n", i)` clamps a negative
+        # start to 0, re-finds the SAME CRLF, re-parses the SAME negative size, and loops
+        # forever at 100% CPU.
+        #
+        # Reachable from any target: to_dict() dechunks every chunked response automatically,
+        # and mcp_server runs one blocking `for line in sys.stdin` loop — so a single hostile
+        # response wedges the whole agent tool channel permanently. No socket timeout can
+        # interrupt it; the hang is in pure Python after the read completes.
+        #
+        # RFC 9112 section 7.1: chunk-size is 1*HEXDIG. A sign is not a hex digit, so this is
+        # malformed framing, which this function reports the same way it reports every other
+        # malformed framing — by returning None so the caller sees the ABSENCE of a decoded
+        # body rather than a wrong one.
+        if n < 0:
             return None
         if n == 0:
             return bytes(out)
@@ -308,6 +361,8 @@ def _dechunk(raw):
             return None
         out += raw[start:end]
         i = end + 2                      # skip the CRLF that terminates the chunk
+        if i <= j:                        # belt and braces: the cursor must always advance,
+            return None                   # whatever arithmetic produced it
     return bytes(out)
 
 
