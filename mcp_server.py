@@ -246,6 +246,8 @@ def _serialise_capped(out):
 
 def _do_send(args):
     args, oob_payload = _inject_oob(args)
+    args = dict(args)
+    extra_notes = _cap_extras(args)
     base, host = _resolve(args)
     if not host:
         return {"error": "no host/authority/base_id given"}
@@ -292,6 +294,8 @@ def _do_send(args):
                                           reqs, connect_port=port,
                                           use_tls=args.get("use_tls", True), sni=sni)
         out = {"credentials_stripped": stripped} if stripped else {}
+        if extra_notes:
+            out["limits"] = extra_notes
         out.update({"ok": all(not x.error for x in rs), "protocol": "http/1.1",
                "count": len(rs), "responses": [x.to_dict() for x in rs],
                "note": "connection-state: response[0]=first request, response[1..]=pipelined on same connection"})
@@ -308,6 +312,8 @@ def _do_send(args):
                               method=method, path=path, headers=headers, body=body,
                               extra_streams=args.get("extra_streams"))
     out = r.to_dict()
+    if extra_notes:
+        out["limits"] = extra_notes
     if stripped:
         out["credentials_stripped"] = stripped
         out["credentials_note"] = (f"{len(stripped)} credential header(s) NOT sent: the request "
@@ -397,6 +403,34 @@ def _do_import(args):
 # doing less than asked.
 MAX_SWEEP_THREADS = int(os.environ.get("TEHUT_PROXY_MAX_SWEEP_THREADS", 64))
 MAX_SWEEP_VALUES = int(os.environ.get("TEHUT_PROXY_MAX_SWEEP_VALUES", 1024))   # a /24 is 256
+
+# The same fan-out, one level down. `extra_requests` (h1 pipelining) and `extra_streams`
+# (h2 multiplexing) each turn ONE tehut_send into N requests, and neither was bounded —
+# so the cap on tehut_sweep could be walked straight around by putting the list here
+# instead. These are deliberately much smaller than the sweep cap: their purpose is
+# connection-state and race work, where the useful numbers are 2-50 requests on ONE
+# connection, not a scan. A number far above that is a mistake or an injection, not an
+# experiment, and h2 servers reject it anyway (SETTINGS_MAX_CONCURRENT_STREAMS is
+# commonly 100-128), which would look like a finding instead of our own error.
+MAX_EXTRA = int(os.environ.get("TEHUT_PROXY_MAX_EXTRA", 64))
+
+
+def _cap_extras(args):
+    """Trim extra_requests/extra_streams to MAX_EXTRA. Returns a list of notes."""
+    notes = []
+    for key in ("extra_requests", "extra_streams"):
+        v = args.get(key)
+        if isinstance(v, list) and len(v) > MAX_EXTRA:
+            notes.append(f"{key} had {len(v)} entries; only the first {MAX_EXTRA} were sent. "
+                         f"This path is for connection-state and race work on ONE connection "
+                         f"— for a scan use tehut_sweep, or raise TEHUT_PROXY_MAX_EXTRA.")
+            args[key] = v[:MAX_EXTRA]
+        elif v is not None and not isinstance(v, list):
+            notes.append(f"{key} must be a list; ignored {type(v).__name__}")
+            args.pop(key, None)
+    for n in notes:
+        log("send: " + n)
+    return notes
 
 
 def _clamp(raw, default, lo, hi):

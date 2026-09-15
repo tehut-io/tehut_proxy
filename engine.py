@@ -56,7 +56,8 @@ class RawResponse:
         # each stream's own status/reset/completion, and `single_write_release` is the
         # single-packet primitive's receipt — a caller asserting on a race result should check
         # it, because False means the timing window was never narrow enough to prove anything.
-        for _k in ("streams", "goaway", "single_write_release"):
+        for _k in ("streams", "goaway", "single_write_release",
+                   "single_write_release_detail", "truncated"):
             _v = getattr(self, _k, None)
             if _v is not None:
                 d[_k] = _v
@@ -88,6 +89,14 @@ def _connect(connect_host, connect_port, use_tls, sni, alpn=None, timeout=15):
     """Open a TCP (and optionally TLS) socket. connect_host/port = where the bytes
     physically go; sni = the TLS server_name (independent of any Host header)."""
     raw = socket.create_connection((connect_host, connect_port), timeout=timeout)
+    # Nagle coalesces small writes, which is exactly what the single-packet primitive
+    # spends its whole design avoiding — and what a smuggling test's deliberate framing
+    # depends on NOT happening. It was never disabled; the primitive got the behaviour it
+    # wanted by accident (the 100ms settle lets the prior write be ACKed). Make it explicit.
+    try:
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     if not use_tls:
         return raw
     ctx = _tls_ctx(alpn)
@@ -135,19 +144,163 @@ def send_http1(connect_host, *, connect_port=443, use_tls=True, sni=None,
     try:
         s.sendall(data)
         s.settimeout(timeout)
-        buf = b""
-        while len(buf) < read_cap:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
+        buf, truncated = _read_until_eof(s, read_cap)
         s.close()
     except Exception as e:
         try: s.close()
         except Exception: pass
         if not buf:
             return RawResponse(error=f"io: {e}", elapsed_ms=int((time.time()-t0)*1000))
-    return _parse_http1(buf, int((time.time()-t0)*1000))
+        truncated = f"read failed after {len(buf)} bytes ({e}) — the response is INCOMPLETE"
+    r = _parse_http1(buf, int((time.time()-t0)*1000))
+    if truncated:
+        r.truncated = truncated
+        r.note = (r.note + " [TRUNCATED] " + truncated).strip()
+    return r
+
+
+def _measure_single_write(sock, payload):
+    """Write the release buffer and report WHAT ACTUALLY HAPPENED. Returns (ok, detail).
+
+    WHY THIS REPLACED A BOOLEAN ECHO (2026-09-15; my own bug, logged 2026-09-14).
+    `single_write_release` was set to `bool(single_packet)` — the caller's own INPUT flag,
+    handed straight back. It therefore said "the single-packet primitive engaged" whenever
+    the caller had asked for it, whether or not anything of the sort occurred. The whole
+    reason that field exists is so a NEGATIVE race result can be trusted: without a real
+    receipt, "no race condition" and "the instrument never fired" are the same output. An
+    instrument that reports its own input is not an instrument. (RULE 2: prove the
+    instrument before concluding anything about a target.)
+
+    Four things have to be true for the release to be one packet, and each is checkable:
+
+      h2 negotiated   If ALPN fell back to http/1.1 the streams are not multiplexed at all
+                      and there is no single-packet attack, only N ordinary requests.
+      one syscall     sendall() LOOPS on partial writes. Two loop iterations are two
+                      segments and a scheduler gap between them — the thing we are
+                      avoiding. Use send() once and check the count.
+      fits the MSS    A buffer larger than the path MSS is split by the kernel no matter
+                      how few syscalls we make. With TLS the record header and AEAD tag
+                      ride along, so the comparison must be against the wire size.
+      nodelay         Set in _connect; re-read here rather than assumed.
+
+    A failure is NOT fatal — the requests still go, and the caller may still learn
+    something. It is recorded, so a race verdict built on it can be discounted.
+    """
+    detail = {}
+    try:
+        alpn = sock.selected_alpn_protocol() if hasattr(sock, "selected_alpn_protocol") else None
+    except Exception:
+        alpn = None
+    detail["alpn"] = alpn
+    detail["h2_negotiated"] = (alpn == "h2")
+
+    try:
+        detail["tcp_nodelay"] = bool(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+    except OSError:
+        detail["tcp_nodelay"] = None
+
+    mss = None
+    try:
+        mss = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
+    except (OSError, AttributeError):
+        pass
+    detail["mss"] = mss
+
+    # TLS 1.2/1.3 AEAD framing: 5-byte record header + up to 16-byte tag + 1 content byte.
+    wire = len(payload) + (29 if hasattr(sock, "selected_alpn_protocol") else 0)
+    detail["release_bytes"] = len(payload)
+    detail["estimated_wire_bytes"] = wire
+    detail["fits_one_segment"] = (wire <= mss) if mss else None
+
+    t = time.time()
+    try:
+        n = sock.send(payload)
+    except Exception as e:
+        detail["error"] = f"{e.__class__.__name__}: {e}"
+        detail["one_syscall"] = False
+        return False, detail
+    detail["write_ms"] = round((time.time() - t) * 1000, 3)
+    detail["one_syscall"] = (n == len(payload))
+    if n < len(payload):
+        # Finish the write — the requests should still be sent — but the primitive is gone.
+        sock.sendall(payload[n:])
+        detail["bytes_first_write"] = n
+
+    ok = bool(detail["h2_negotiated"] and detail["one_syscall"]
+              and detail["fits_one_segment"] is not False)
+    if not ok:
+        why = []
+        if not detail["h2_negotiated"]:
+            why.append(f"ALPN negotiated {alpn!r}, not h2 — these were not multiplexed streams")
+        if not detail["one_syscall"]:
+            why.append(f"the release needed more than one write ({n} of {len(payload)} bytes "
+                       f"went first) — the requests were split across segments")
+        if detail["fits_one_segment"] is False:
+            why.append(f"the release is ~{wire} bytes against an MSS of {mss} — the kernel "
+                       f"split it regardless of syscall count; shrink the bodies")
+        detail["why_not"] = "; ".join(why)
+        detail["verdict"] = ("The single-packet primitive did NOT engage. A negative race "
+                             "result from this run proves nothing about the target.")
+    else:
+        detail["verdict"] = ("Release went out as one write of one segment over h2 — the "
+                             "timing window is as narrow as this technique gets.")
+    return ok, detail
+
+
+def _hdr_text(v):
+    """Decode one h2 header name/value to text WITHOUT ever raising. Returns (text, lossy).
+
+    WHY (2026-09-15). This was a bare `v.decode()` — UTF-8, strict. A header value with one
+    invalid UTF-8 byte raised UnicodeDecodeError, and because the raise happened inside the
+    receive loop's `except Exception: pass`, the loop exited and EVERY byte already collected
+    was discarded. Silently. So a target could delete its own response from our evidence by
+    emitting a single 0x80, and the tool would report "no :status (reset/timeout/closed)" —
+    indistinguishable from a network failure. A raw-request tool must never let the peer
+    choose what it is able to observe.
+
+    latin1 is the right decoder here, not utf-8/replace: it maps every byte 1:1 and is
+    reversible, so the exact bytes survive for a caller doing byte-level comparison, and it
+    is what _parse_http1 already uses for the h1 side. `lossy` reports that the bytes were
+    NOT valid UTF-8, so a reader knows the text shown is a byte-for-byte transcription
+    rather than the string the server meant.
+    """
+    if not isinstance(v, bytes):
+        return v, False
+    try:
+        v.decode("utf-8")
+        lossy = False
+    except UnicodeDecodeError:
+        lossy = True
+    return v.decode("latin1"), lossy
+
+
+def _read_until_eof(sock, read_cap):
+    """Read to EOF or the cap. Returns (buf, truncation) — truncation is "" when complete.
+
+    WHY THIS IS NOT JUST A LOOP (2026-09-15). The three call sites each wrote
+    `while len(buf) < read_cap: ...` and then handed the bytes on, so a response cut off
+    at the cap was INDISTINGUISHABLE from one that ended there. That is the worst kind of
+    bug for this tool: the whole product claim is that a finding is earned from evidence,
+    and "the admin panel did not contain the marker" reads identically whether the marker
+    was absent or sat at byte 200_001. A truncated read must announce itself, because the
+    conclusion drawn from it is different.
+
+    A timeout with bytes already in hand is also truncation, not success — the peer may
+    simply be slow, and the tail we never saw is the part we were looking for.
+    """
+    buf = b""
+    while len(buf) < read_cap:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            return buf, (f"read timed out after {len(buf)} bytes — the response is INCOMPLETE. "
+                         f"Do not conclude anything from an absent marker; raise timeout=.")
+        if not chunk:
+            return buf, ""                    # clean EOF: this is the whole response
+        buf += chunk
+    return buf, (f"hit the {read_cap}-byte read cap — the response is TRUNCATED and the "
+                 f"tail was never received. Do not conclude anything from an absent "
+                 f"marker; raise read_cap=.")
 
 
 def _build_http1_request(spec):
@@ -298,18 +451,24 @@ def send_http1_conn_state(connect_host, requests, *, connect_port=443, use_tls=T
     try:
         s.sendall(data)
         s.settimeout(timeout)
-        while len(buf) < read_cap:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
+        buf, truncated = _read_until_eof(s, read_cap)
         s.close()
     except Exception as e:
         try: s.close()
         except Exception: pass
         if not buf:
             return [RawResponse(error=f"io: {e}", elapsed_ms=int((time.time()-t0)*1000))]
+        truncated = f"read failed after {len(buf)} bytes ({e}) — the response is INCOMPLETE"
     resps = _split_http1_responses(buf, max_responses=len(requests))
+    if truncated and resps:
+        # Only the LAST response can be the cut one; the earlier ones are framed whole.
+        # Flagging them all would train the operator to ignore the flag.
+        resps[-1].truncated = truncated
+        resps[-1].note = (resps[-1].note + " [TRUNCATED] " + truncated).strip()
+    if truncated and len(resps) < len(requests):
+        for _r in resps[-1:]:
+            _r.note += (f" Only {len(resps)} of {len(requests)} pipelined responses were "
+                        f"received before the read ended.")
     if resps:
         resps[-1].elapsed_ms = int((time.time()-t0)*1000)
     return resps or [RawResponse(error="no response parsed", body=buf,
@@ -388,7 +547,7 @@ def _parse_http1(buf, elapsed):
 # ── HTTP/2 ───────────────────────────────────────────────────────────────────
 def send_http2(connect_host, *, connect_port=443, sni=None, authority=None,
                scheme="https", method="GET", path="/", headers=None, body=b"",
-               extra_streams=None, timeout=15, single_packet=False):
+               extra_streams=None, timeout=15, single_packet=False, read_cap=400_000):
     """Send an HTTP/2 request with explicit pseudo-headers.
 
     `authority` = the :authority pseudo-header (Burp shows it as "Host"). You may
@@ -501,8 +660,9 @@ def send_http2(connect_host, *, connect_port=443, sni=None, authority=None,
         for st in _streams:
             conn.send_data(st["sid"], st["body"][-1:], end_stream=True)
         _release = conn.data_to_send()          # ONE buffer …
-        s.sendall(_release)                     # … ONE write
+        _spa_ok, _spa_detail = _measure_single_write(s, _release)   # … measured, not assumed
     else:
+        _spa_ok, _spa_detail = False, None
         for st in _streams:
             conn.send_headers(st["sid"], st["hdrs"], end_stream=(not st["body"]))
             if st["body"]:
@@ -521,12 +681,29 @@ def send_http2(connect_host, *, connect_port=443, sni=None, authority=None,
                         "reset": None, "complete": False} for st in _streams}
     _goaway = None
     _open = set(_per)
+    # The h1 paths take a read_cap; this loop had NONE, so `r["body"] += ev.data` grew
+    # without bound and a large (or deliberately endless) response was an OOM against us.
+    # It also needs the same truncation receipt as h1 — see _read_until_eof.
+    _truncated = ""
+    _total = 0
     s.settimeout(timeout)
     try:
         while _open:
-            data = s.recv(65536)
+            if _total >= read_cap:
+                _truncated = (f"hit the {read_cap}-byte read cap across all streams — the "
+                              f"response is TRUNCATED. Do not conclude anything from an "
+                              f"absent marker; raise read_cap=.")
+                break
+            try:
+                data = s.recv(65536)
+            except socket.timeout:
+                _truncated = (f"read timed out with {len(_open)} stream(s) still open — the "
+                              f"response is INCOMPLETE. Do not conclude anything from an "
+                              f"absent marker; raise timeout=.")
+                break
             if not data:
                 break
+            _total += len(data)
             for ev in conn.receive_data(data):
                 cls = ev.__class__.__name__
                 if cls == "ConnectionTerminated":
@@ -538,8 +715,10 @@ def send_http2(connect_host, *, connect_port=443, sni=None, authority=None,
                     continue
                 if getattr(ev, "headers", None):
                     for k, v in ev.headers:
-                        k = k.decode() if isinstance(k, bytes) else k
-                        v = v.decode() if isinstance(v, bytes) else v
+                        k, k_lossy = _hdr_text(k)
+                        v, v_lossy = _hdr_text(v)
+                        if k_lossy or v_lossy:
+                            r["lossy_headers"] = sorted(set(r.get("lossy_headers", []) + [k]))
                         if k == ":status":
                             r["status"] = int(v) if str(v).isdigit() else 0
                         else:
@@ -555,8 +734,15 @@ def send_http2(connect_host, *, connect_port=443, sni=None, authority=None,
                     _open.discard(_sid_ev)
             try: s.sendall(conn.data_to_send())
             except Exception: break
-    except Exception:
-        pass
+    except Exception as _e_recv:
+        # This used to be a bare `pass`. Every failure in the receive loop — a protocol
+        # error, a decode, a reset mid-frame — looked exactly like a clean end of response,
+        # so a partial read was presented as a complete one.
+        _truncated = _truncated or (f"receive loop ended on {_e_recv.__class__.__name__}: "
+                                    f"{_e_recv} — the response is INCOMPLETE")
+    if _open and not _truncated:
+        _truncated = (f"connection closed with {len(_open)} stream(s) neither ended nor "
+                      f"reset — the response is INCOMPLETE")
     s.close()
     _first = _per[1]
     status, rheaders, rbody = _first["status"], _first["headers"], _first["body"]
@@ -567,7 +753,11 @@ def send_http2(connect_host, *, connect_port=443, sni=None, authority=None,
                          note="server reset the stream (often :authority!=SNI or policy block)")
         _e.streams = [dict(x, body_len=len(x["body"]), body=None) for x in _per.values()]
         _e.goaway = _goaway
-        _e.single_write_release = bool(single_packet)
+        _e.single_write_release = _spa_ok
+        if _spa_detail:
+            _e.single_write_release_detail = _spa_detail
+        if _truncated:
+            _e.truncated = _truncated
         return _e
     if status == 0:
         return RawResponse(protocol="h2", elapsed_ms=el, error="no :status (reset/timeout/closed)",
@@ -579,7 +769,16 @@ def send_http2(connect_host, *, connect_port=443, sni=None, authority=None,
     # result is indistinguishable from an instrument that never fired.
     _r.streams = [dict(x, body_len=len(x["body"]), body=None) for x in _per.values()]
     _r.goaway = _goaway
-    _r.single_write_release = bool(single_packet)
+    _r.single_write_release = _spa_ok
+    if _spa_detail:
+        _r.single_write_release_detail = _spa_detail
+    if _truncated:
+        _r.truncated = _truncated
+        _r.note = (_r.note + " [TRUNCATED] " + _truncated).strip()
+    _lossy = sorted({h for x in _per.values() for h in x.get("lossy_headers", [])})
+    if _lossy:
+        _r.note = (_r.note + f" [non-UTF-8 header bytes in {_lossy}; values are a latin1 "
+                             f"byte-for-byte transcription]").strip()
     return _r
 
 
