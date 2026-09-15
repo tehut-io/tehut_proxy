@@ -386,12 +386,49 @@ def _do_import(args):
 
 
 # ── sweep (routing-SSRF /24, cache-key probe, vhost fuzz) ────────────────────
+# A sweep is the one tool here that turns ONE agent decision into N requests at a
+# target, so it is the one that has to be bounded. Both numbers came straight from
+# the caller: `int(args.get("threads", 20))` accepted 5000, and values[] accepted a
+# /16. The agent's context contains text from target responses, so "sweep this /16
+# with 5000 threads" is a sentence a hostile page can put in front of it — and even
+# with no attacker, an over-eager agent pointing 5000 threads at a client's box is a
+# denial of service we would have caused ourselves. Bound them here, once, where the
+# fan-out happens, and say plainly when a request was clamped rather than silently
+# doing less than asked.
+MAX_SWEEP_THREADS = int(os.environ.get("TEHUT_PROXY_MAX_SWEEP_THREADS", 64))
+MAX_SWEEP_VALUES = int(os.environ.get("TEHUT_PROXY_MAX_SWEEP_VALUES", 1024))   # a /24 is 256
+
+
+def _clamp(raw, default, lo, hi):
+    """(value, note). Non-numeric falls back to the default rather than raising a 500."""
+    try:
+        n = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default, f"threads={raw!r} is not a number; used {default}"
+    if n < lo:
+        return lo, f"threads={n} raised to the minimum {lo}"
+    if n > hi:
+        return hi, (f"threads={n} clamped to {hi} — this fires at a live target, and "
+                    f"the cap is TEHUT_PROXY_MAX_SWEEP_THREADS")
+    return n, ""
+
+
 def _do_sweep(args):
     vary = args.get("vary", "authority")        # authority | host | path
     values = args.get("values") or []
     if not values:
         return {"error": "values[] required (e.g. the 256 IPs of a /24, or candidate vhosts)"}
-    threads = int(args.get("threads", 20))
+    notes = []
+    if len(values) > MAX_SWEEP_VALUES:
+        notes.append(f"values[] had {len(values)} entries; only the first "
+                     f"{MAX_SWEEP_VALUES} were swept. Split the range into runs you "
+                     f"actually mean to send, or raise TEHUT_PROXY_MAX_SWEEP_VALUES.")
+        values = values[:MAX_SWEEP_VALUES]
+    threads, tnote = _clamp(args.get("threads"), 20, 1, MAX_SWEEP_THREADS)
+    if tnote:
+        notes.append(tnote)
+    for n in notes:
+        log("sweep: " + n)
     has_oob = "{{OOB}}" in json.dumps(args)      # per-value OOB so callbacks self-identify
 
     def one(val):
@@ -414,13 +451,17 @@ def _do_sweep(args):
             row["oob_marker"] = oob_marker
         return row
 
-    results = list(ThreadPoolExecutor(max_workers=threads).map(one, values))
+    # `list(ThreadPoolExecutor(...).map(...))` never shut the pool down; in a long-lived
+    # stdio server every sweep leaked its worker threads.
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        results = list(pool.map(one, values))
     # surface the outliers (the finding)
     from collections import Counter
     common = Counter((x["status"], x["len"]) for x in results).most_common(1)
     common_key = common[0][0] if common else (None, None)
     outliers = [x for x in results if (x["status"], x["len"]) != common_key]
     return {"ok": True, "count": len(results), "vary": vary,
+            **({"limits": notes} if notes else {}),
             "common": {"status": common_key[0], "len": common_key[1],
                        "n": common[0][1] if common else 0},
             "outliers": outliers[:50],
@@ -482,8 +523,11 @@ TOOLS = [
                     "values=['192.168.0.0'..'192.168.0.255'] → the admin shows up as the non-504.",
      "inputSchema": {"type": "object", "properties": {
          "vary": {"type": "string", "enum": ["authority", "host", "path"], "default": "authority"},
-         "values": {"type": "array", "items": {"type": "string"}},
-         "threads": {"type": "integer", "default": 20},
+         "values": {"type": "array", "items": {"type": "string"},
+                    "description": "Values to sweep (a /24 = 256). Only the first " + str(MAX_SWEEP_VALUES) + " are sent."},
+         "threads": {"type": "integer", "default": 20, "minimum": 1,
+                     "maximum": MAX_SWEEP_THREADS,
+                     "description": "Concurrent requests. Clamped server-side — a sweep fires at a live target, so this is a rate decision, not a speed dial."},
          "protocol": {"type": "string", "enum": ["h1", "h2"], "default": "h2"},
          "sni": {"type": "string"}, "connect_host": {"type": "string", "description": "where THIS TOOL's TCP connection goes (default: sni/host). It is not an SSRF payload slot: to test whether the TARGET can reach an internal address, put that address in a header or body value. Link-local and cloud metadata addresses are refused here, and pointing it away from base_id's origin drops the stored credential headers."},
          "allow_cross_host_credentials": {"type": "boolean", "default": False,

@@ -167,6 +167,82 @@ class Locking(unittest.TestCase):
         self.assertEqual(big["body"], got[0]["body"])
 
 
+class Rotation(unittest.TestCase):
+    """history.jsonl is a CREDENTIAL store, so unbounded growth is a security fault,
+    not just a disk one — and every lookup re-reads the whole file."""
+
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.p = Path(self.d.name) / "history.jsonl"
+
+    def tearDown(self):
+        self.d.cleanup()
+
+    def _fill(self, n, size=2000, **kw):
+        for i in range(n):
+            store.append(self.p, {"id": str(i), "body": "x" * size}, **kw)
+
+    def test_oldest_entries_are_dropped_once_the_cap_is_passed(self):
+        self._fill(60, max_bytes=20000, keep=10)
+        got = [e["id"] for e in store.read_all(self.p)]
+        self.assertLessEqual(len(got), 11)
+        self.assertEqual("59", got[-1], "the newest entry must survive its own append")
+        self.assertNotIn("0", got, "the oldest entry should have been dropped")
+
+    def test_the_file_stays_bounded(self):
+        self._fill(300, size=1000, max_bytes=20000, keep=5)
+        self.assertLess(self.p.stat().st_size, 60000)
+
+    def test_every_surviving_line_is_still_whole_json(self):
+        # A trim that cut mid-line would corrupt the first entry the next reader sees.
+        self._fill(80, max_bytes=15000, keep=7)
+        for ln in self.p.read_text().splitlines():
+            if ln.strip():
+                json.loads(ln)
+
+    def test_trimming_preserves_permissions(self):
+        self._fill(60, max_bytes=20000, keep=5)
+        self.assertEqual(0o600, mode_of(self.p))
+
+    def test_under_the_cap_nothing_is_dropped(self):
+        self._fill(20, size=100, max_bytes=1 << 20, keep=5)
+        self.assertEqual(20, len(store.read_all(self.p)))
+
+    def test_a_few_enormous_entries_are_kept_not_wiped(self):
+        # keep=10 but only 2 entries exist, both huge. Dropping them to satisfy a byte
+        # cap would delete the request the operator is working on right now.
+        for i in range(2):
+            store.append(self.p, {"id": str(i), "body": "x" * 50000}, max_bytes=1000, keep=10)
+        self.assertEqual(["0", "1"], [e["id"] for e in store.read_all(self.p)])
+
+    def test_rotation_off_when_the_cap_is_zero(self):
+        self._fill(30, size=500, max_bytes=0, keep=5)
+        self.assertEqual(30, len(store.read_all(self.p)))
+
+    def test_concurrent_writers_rotating_never_corrupt_a_line(self):
+        # Rotation happens under the same exclusive lock as the append, so a second
+        # process must never see (or write into) a half-trimmed file.
+        script = textwrap.dedent(f'''
+            import sys
+            sys.path.insert(0, {str(HERE)!r})
+            import store
+            who = sys.argv[1]
+            for i in range(60):
+                store.append({str(self.p)!r}, {{"id": f"{{who}}-{{i}}", "body": who * 500}},
+                             max_bytes=30000, keep=12)
+        ''')
+        ps = [subprocess.Popen([sys.executable, "-c", script, who])
+              for who in ("aaaa", "bbbb")]
+        for x in ps:
+            self.assertEqual(0, x.wait(60))
+        lines = [ln for ln in self.p.read_text().splitlines() if ln.strip()]
+        for ln in lines:
+            e = json.loads(ln)                      # raises on an interleaved line
+            self.assertEqual(1, len(set(e["body"])), "two writers' bytes in one entry")
+        self.assertLessEqual(len(lines), 14)
+        self.assertGreater(len(lines), 0)
+
+
 class WiredIntoTheServers(unittest.TestCase):
     """Both writers must use the module — one that doesn't undoes it for the other."""
 

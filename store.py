@@ -97,14 +97,80 @@ def _open_private(path, flags):
     return fd
 
 
-def append(path, entry):
+# ── rotation ─────────────────────────────────────────────────────────────────
+# history.jsonl grew without bound. Two reasons that is worse here than for an
+# ordinary log:
+#
+#   • IT IS A CREDENTIAL STORE. Every entry holds the Cookie/Authorization headers
+#     of the request it captured. Unbounded means a session token from an
+#     engagement six months ago is still on disk, still valid or not, still one
+#     `cat` from anyone who gets the file. Old captures are not an asset.
+#   • EVERY LOOKUP READS THE WHOLE FILE. mcp_server.py's _get() re-parses the
+#     entire history to find ONE id, and _do_sweep calls it once per swept value.
+#     A 200MB history turns a 256-value sweep into 51GB of JSON parsing.
+#
+# Trim IN PLACE (ftruncate + rewrite) rather than renaming to history.jsonl.1:
+# a rename leaves a second copy of the credentials lying around, and it swaps the
+# inode under any process that opened the path and is blocked on the flock — it
+# would then write into an unlinked file and lose the entry. Truncation keeps one
+# inode, so the lock keeps meaning what it says.
+MAX_BYTES = int(os.environ.get("TEHUT_PROXY_HISTORY_MAX_BYTES", 32 << 20))   # 32 MiB
+KEEP = int(os.environ.get("TEHUT_PROXY_HISTORY_KEEP", 2000))                 # entries
+
+
+def _trim(fd, path, keep=None, max_bytes=None):
+    """Keep the last `keep` entries if the file has passed `max_bytes`. Caller holds LOCK_EX.
+
+    Returns the number of entries dropped. Entries are dropped OLDEST first, and the
+    file is left with whole lines only — a trim that cut mid-line would corrupt the
+    very first entry the next reader sees.
+    """
+    keep = KEEP if keep is None else keep
+    max_bytes = MAX_BYTES if max_bytes is None else max_bytes
+    if max_bytes <= 0 or keep <= 0:
+        return 0
+    if os.fstat(fd).st_size <= max_bytes:
+        return 0
+
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        b = os.read(fd, 1 << 20)
+        if not b:
+            break
+        chunks.append(b)
+    lines = [ln for ln in b"".join(chunks).split(b"\n") if ln.strip()]
+    if len(lines) <= keep:
+        # One or a few entries are simply enormous; dropping them all would lose the
+        # request the operator is working on right now. Leave it and say so.
+        _warn(f"oversize:{path}",
+              f"{path} is over {max_bytes} bytes but holds only {len(lines)} entries — "
+              f"not trimming. Raise TEHUT_PROXY_HISTORY_MAX_BYTES or lower the body sizes.")
+        return 0
+
+    dropped = len(lines) - keep
+    kept = b"\n".join(lines[-keep:]) + b"\n"
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, kept)
+    os.fsync(fd)
+    _warn(f"trim:{path}", f"{path} passed {max_bytes} bytes — dropped the {dropped} oldest "
+                          f"entries, kept {keep}. Captured credentials do not age well; "
+                          f"set TEHUT_PROXY_HISTORY_KEEP to change this.")
+    return dropped
+
+
+def append(path, entry, keep=None, max_bytes=None):
     """Append one JSON entry under an exclusive flock. Returns True if written.
 
-    The lock is held across the write and released by the close, so a reader taking
-    a shared lock never sees a partial line and two writers never interleave.
+    The lock is held across the write AND any rotation, then released by the close,
+    so a reader taking a shared lock never sees a partial line or a half-trimmed file,
+    and two writers never interleave.
     """
     line = json.dumps(entry) + "\n"
-    fd = _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    # O_RDWR, not O_WRONLY: the trim has to read the file back to find the line
+    # boundaries, and it must do so on the fd that already holds the lock.
+    fd = _open_private(path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
     try:
         if fcntl is not None:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -112,6 +178,7 @@ def append(path, entry):
             _warn("nolock", "fcntl unavailable — history appends are not serialised "
                             "across processes on this platform")
         os.write(fd, line.encode())
+        _trim(fd, path, keep=keep, max_bytes=max_bytes)
         return True
     finally:
         try:

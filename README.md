@@ -130,3 +130,7 @@ you're after. This is the small sharp thing you reach for when it isn't.
 ## License
 
 Apache 2.0.
+
+## Security review
+
+Open and completed hardening items live in [SECURITY_REVIEW.md](SECURITY_REVIEW.md) — one shared list, so the same fix does not get written twice. Claim an item there before starting it.

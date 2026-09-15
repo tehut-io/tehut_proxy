@@ -180,5 +180,68 @@ class SendPathIntegration(unittest.TestCase):
             self.assertIn("cookie", {k.lower() for k, _ in kw["headers"]})
 
 
+class SweepCaps(unittest.TestCase):
+    """A sweep turns ONE agent decision into N requests at a live target, so it is the
+    one surface where an unbounded number is a denial of service we cause ourselves."""
+
+    def setUp(self):
+        self.sent = []
+        self._h1 = M.engine.send_http1
+        M.engine.send_http1 = self._record
+        self._get = M._get
+        M._get = lambda i: {"host": "bank.example", "method": "GET", "path": "/",
+                            "headers": []}
+
+    def tearDown(self):
+        M.engine.send_http1 = self._h1
+        M._get = self._get
+
+    def _record(self, _dest, **kw):
+        self.sent.append(_dest)
+        class R:
+            def to_dict(_): return {"status": 200, "body_len": 0}
+        return R()
+
+    def _sweep(self, **kw):
+        a = {"base_id": "x", "protocol": "h1", "vary": "host"}
+        a.update(kw)
+        return M._do_sweep(a)
+
+    def test_values_beyond_the_cap_are_not_sent(self):
+        # A /16 is 65536 requests. The cap is what stops "sweep this /16" from being
+        # a sentence a hostile page can put in front of the agent.
+        out = self._sweep(values=[f"h{i}.test" for i in range(M.MAX_SWEEP_VALUES + 50)],
+                          threads=4)
+        self.assertEqual(M.MAX_SWEEP_VALUES, len(self.sent))
+        self.assertEqual(M.MAX_SWEEP_VALUES, out["count"])
+        self.assertTrue(any("only the first" in n for n in out["limits"]))
+
+    def test_thread_count_is_clamped(self):
+        out = self._sweep(values=["a.test", "b.test"], threads=5000)
+        self.assertTrue(any("clamped" in n for n in out["limits"]))
+
+    def test_a_reasonable_request_is_not_annotated(self):
+        out = self._sweep(values=["a.test", "b.test"], threads=8)
+        self.assertNotIn("limits", out)
+        self.assertEqual(2, len(self.sent))
+
+    def test_zero_or_negative_threads_does_not_crash_the_pool(self):
+        # ThreadPoolExecutor(max_workers=0) raises; the old int() passed it straight through.
+        for bad in (0, -5):
+            self.sent.clear()
+            out = self._sweep(values=["a.test"], threads=bad)
+            self.assertEqual(1, len(self.sent), bad)
+            self.assertTrue(any("minimum" in n for n in out["limits"]), bad)
+
+    def test_non_numeric_threads_falls_back_instead_of_500ing(self):
+        self.sent.clear()
+        out = self._sweep(values=["a.test"], threads="lots")
+        self.assertEqual(1, len(self.sent))
+        self.assertTrue(any("not a number" in n for n in out["limits"]))
+
+    def test_empty_values_still_rejected(self):
+        self.assertIn("error", self._sweep(values=[]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
